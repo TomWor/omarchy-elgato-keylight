@@ -182,6 +182,8 @@ its staging flash just by being addressed.
 - `tests/test_keylight.py` — 71 unit tests over the helper
 - `tests/harness/shell.qml` — standalone window for developing the panel without
   a running Omarchy shell
+- `preview.png` — composite of the screenshots below, at the repository root
+  because that is where the plugin marketplace looks for a listing image
 
 ## How it works
 
