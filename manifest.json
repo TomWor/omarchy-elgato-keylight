@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 1,
+  "id": "nille.elgato-keylight",
+  "name": "Elgato Key Light",
+  "version": "1.0.0",
+  "author": "nille",
+  "license": "MIT",
+  "description": "Elgato Key Light control: power, brightness, and color temperature for one or many lights.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Key Light",
+    "description": "Toggle Elgato Key Lights, set brightness and color temperature, as a group or per light.",
+    "category": "System",
+    "aliases": ["elgato", "keylight", "light"],
+    "defaultSection": "right",
+    "allowMultiple": false,
+    "defaults": {
+      "hosts": "",
+      "refreshIntervalSec": 30,
+      "groupMode": true,
+      "hideWhenAbsent": false
+    },
+    "schema": [
+      {
+        "key": "hosts",
+        "type": "string",
+        "label": "Light addresses",
+        "defaultValue": "",
+        "description": "Optional. Comma-separated IP addresses (e.g. 192.168.1.10, 192.168.1.11) to skip mDNS discovery. Leave empty to find lights automatically."
+      },
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 5,
+        "max": 3600,
+        "step": 5,
+        "defaultValue": 30,
+        "description": "How often to re-read light state while the panel is open."
+      },
+      {
+        "key": "groupMode",
+        "type": "boolean",
+        "label": "Start in group mode",
+        "defaultValue": true,
+        "description": "Control all lights together by default. Toggle per-session with 'g' in the panel."
+      },
+      {
+        "key": "hideWhenAbsent",
+        "type": "boolean",
+        "label": "Hide when no lights found",
+        "defaultValue": false,
+        "description": "Remove the bar icon entirely when no Key Lights are on the network."
+      }
+    ]
+  }
+}

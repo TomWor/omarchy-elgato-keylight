@@ -1,0 +1,876 @@
+#!/usr/bin/env python3
+"""Elgato Key Light control for the Omarchy shell.
+
+One-shot CLI. Every subcommand prints a single JSON object on stdout and
+exits 0 — including on failure, where it prints {"ok": false, "error": ...}.
+The panel is a UI, not an error handler: it should never have to distinguish
+"the helper crashed" from "the light is unplugged", so both arrive as data.
+
+Subcommands:
+  discover              mDNS scan for _elg._tcp devices, print what was found
+  state                 read every known light (concurrently)
+  set                   mutate lights (--on/--off/--toggle/--brightness/--temperature)
+  rename                set a light's persistent display name
+  identify              blink a light so you can tell which one it is
+  firmware              report firmware version and whether an update is possible
+  firmware-flash        write a firmware image to one light (requires --yes)
+
+Devices come from --host (repeatable) when given, otherwise from mDNS
+discovery cached in $XDG_CACHE_HOME/omarchy-elgato-keylight/devices.json. Discovery is the
+slow path (~1s of network waiting), so the cache is what keeps the panel
+responsive; `state` refreshes it in the background only when it is stale.
+
+Only the Python 3 standard library is used, so the plugin stays a git clone
+with no build step and no pip install.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+
+# ---------------------------------------------------------------- constants
+
+PORT = 9123
+
+# Brightness is a straight percentage and the firmware clamps it itself.
+BRIGHTNESS_MIN, BRIGHTNESS_MAX = 0, 100
+
+# Temperature is sent in mired (micro-reciprocal degrees): mired = 1e6 / kelvin.
+# The firmware does NOT clamp this — a PUT of 100 or 400 is stored verbatim and
+# drives the LEDs outside their calibrated range. These bounds are the Key
+# Light's real limits (verified against hardware), so we clamp before sending.
+TEMP_MIN, TEMP_MAX = 143, 344  # mired -> ~7000K .. ~2900K
+
+# Kelvin ends of the same range, rounded to the round numbers Elgato's own
+# apps display. Derived from the mired bounds rather than stated twice.
+KELVIN_MIN, KELVIN_MAX = 2900, 7000
+
+HTTP_TIMEOUT = 2.5      # per-request; a sleeping light on wifi answers in ~50ms
+# `avahi-browse -t` settles in ~1s once the daemon has a warm mDNS cache, but
+# the first browse after boot has been measured well past 2s. Budget generously:
+# discovery is cached, so this is paid on cold start, not on every refresh.
+DISCOVER_TIMEOUT = 6.0
+CACHE_TTL = 300         # seconds before the device cache is considered stale
+MAX_PARALLEL = 8
+
+# ---- firmware flashing ----
+# Control Center's own chunk size, reproduced from a capture of its update
+# traffic. The firmware's receive buffer is sized for it; larger chunks are
+# rejected outright.
+FW_CHUNK = 4096
+# There is no flow control on the wire beyond the device answering 408 when it
+# is still flushing the previous chunk, so pace the writes rather than relying
+# on backpressure that does not exist.
+FW_CHUNK_DELAY = 0.025
+# Per-chunk retry budget. Control Center gives up around 10-15 consecutive
+# timeouts; matching that means a genuinely wedged device fails fast instead of
+# looping for minutes over a link that is not going to recover.
+FW_MAX_RETRIES = 12
+FW_TIMEOUT = 10.0       # prepare erases flash and execute reboots: both are slow
+# Sanity bounds on the image. A Key Light image is ~750KB; anything far outside
+# that is a wrong file, and refusing it is cheaper than half-flashing a light.
+FW_MIN_SIZE, FW_MAX_SIZE = 64 * 1024, 8 * 1024 * 1024
+
+
+def cache_path() -> str:
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(
+        os.path.expanduser("~"), ".cache"
+    )
+    return os.path.join(base, "omarchy-elgato-keylight", "devices.json")
+
+
+# ---------------------------------------------------------------- conversions
+
+
+def clamp(value, low: int, high: int, fallback: int | None = None) -> int | None:
+    """Coerce to int and clamp into [low, high]. Junk yields `fallback`."""
+    try:
+        n = int(round(float(value)))
+    except (TypeError, ValueError):
+        return fallback
+    return max(low, min(high, n))
+
+
+def mired_to_kelvin(mired) -> int | None:
+    """mired -> kelvin, snapped to the nearest 50K.
+
+    Snapping matters because the round trip is lossy: 4000K becomes 250 mired
+    which comes back as 4000K, but 5000K becomes 200 which returns 5000K while
+    5013K also becomes 200. Without snapping the UI would show jittery values
+    like 4998K after a set of 5000K.
+    """
+    m = clamp(mired, TEMP_MIN, TEMP_MAX)
+    if m is None:
+        return None
+    return int(round(1_000_000 / m / 50.0) * 50)
+
+
+def kelvin_to_mired(kelvin) -> int | None:
+    """kelvin -> mired, clamped to what the hardware can actually produce."""
+    try:
+        k = float(kelvin)
+    except (TypeError, ValueError):
+        return None
+    if k <= 0:
+        return None
+    k = max(KELVIN_MIN, min(KELVIN_MAX, k))
+    return clamp(1_000_000 / k, TEMP_MIN, TEMP_MAX)
+
+
+# ---------------------------------------------------------------- discovery
+
+
+def parse_avahi(text: str) -> list[dict]:
+    """Parse `avahi-browse -tpr _elg._tcp` resolve lines.
+
+    Format is semicolon-separated with '\\' escapes, and every device is
+    reported once per address family. Only IPv4 '=' (resolved) lines are
+    taken: the shell talks to these over plain HTTP where an IPv6
+    link-local address would need a scope id the URL cannot carry.
+
+    Fields: =;iface;proto;name;type;domain;hostname;address;port;txt...
+    """
+    found: dict[str, dict] = {}
+    for line in text.splitlines():
+        if not line.startswith("="):
+            continue
+        parts = line.split(";")
+        if len(parts) < 9 or parts[2] != "IPv4":
+            continue
+        host, port = parts[7].strip(), parts[8].strip()
+        if not host:
+            continue
+        # avahi escapes spaces as \032 and other bytes as \NNN (decimal).
+        name = re.sub(
+            r"\\(\d{3})", lambda m: chr(int(m.group(1))), parts[3]
+        ).strip()
+        try:
+            port_n = int(port)
+        except ValueError:
+            port_n = PORT
+        # Keyed by address so the IPv6 duplicate of the same light collapses.
+        found.setdefault(host, {"host": host, "port": port_n, "name": name})
+    return sorted(found.values(), key=lambda d: d["host"])
+
+
+def discover(timeout: float = DISCOVER_TIMEOUT) -> list[dict]:
+    """Find Key Lights via mDNS. Returns [] when avahi is absent or silent."""
+    exe = shutil.which("avahi-browse")
+    if not exe:
+        return []
+    try:
+        proc = subprocess.run(
+            [exe, "-tpr", "_elg._tcp"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # Lights already resolved before the deadline are still valid. Dropping
+        # them would report "no lights found" on a network where the browse is
+        # merely slow, so keep whatever was printed.
+        partial = exc.stdout or ""
+        if isinstance(partial, bytes):
+            partial = partial.decode("utf-8", "replace")
+        return parse_avahi(partial)
+    except OSError:
+        return []
+    return parse_avahi(proc.stdout or "")
+
+
+def read_cache() -> tuple[list[dict], float]:
+    """Return (devices, age_seconds). Missing/corrupt cache reads as empty."""
+    try:
+        with open(cache_path(), "r", encoding="utf-8") as fh:
+            blob = json.load(fh)
+        devices = [d for d in blob.get("devices", []) if isinstance(d, dict) and d.get("host")]
+        return devices, max(0.0, time.time() - float(blob.get("at", 0)))
+    except (OSError, ValueError, TypeError):
+        return [], float("inf")
+
+
+def write_cache(devices: list[dict]) -> None:
+    """Persist the device list. Best-effort: a read-only cache dir is not fatal.
+
+    Written to a temp file and renamed so a concurrent `state` never observes
+    a half-written array.
+    """
+    path = cache_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"at": time.time(), "devices": devices}, fh)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def resolve_devices(hosts: list[str], refresh: bool) -> tuple[list[dict], bool]:
+    """Decide which lights to talk to.
+
+    Explicit --host wins and is never cached, so a pinned address in
+    shell.json keeps working on a network where mDNS is blocked. Otherwise
+    use the cache, and only pay for discovery when asked or when nothing
+    usable is cached.
+    """
+    if hosts:
+        return [parse_host(h) for h in hosts], False
+    cached, age = read_cache()
+    if refresh or not cached or age > CACHE_TTL:
+        found = discover()
+        if found:
+            write_cache(found)
+            return found, True
+        # Discovery failed: stale known lights beat showing nothing at all.
+        return cached, False
+    return cached, False
+
+
+def parse_host(value: str) -> dict:
+    """Accept 'host' or 'host:port'. Bare IPv6 is not supported (see parse_avahi)."""
+    text = str(value).strip()
+    if text.count(":") == 1:
+        host, _, port = text.partition(":")
+        try:
+            return {"host": host.strip(), "port": int(port), "name": ""}
+        except ValueError:
+            pass
+    return {"host": text, "port": PORT, "name": ""}
+
+
+# ---------------------------------------------------------------- HTTP
+
+
+def request(device: dict, payload: dict | None = None) -> dict:
+    """GET (payload None) or PUT /elgato/lights. Returns the parsed reply.
+
+    Raises OSError/ValueError on failure; callers turn that into per-light
+    error state rather than failing the whole command.
+    """
+    url = f"http://{device['host']}:{device.get('port', PORT)}/elgato/lights"
+    data = None
+    headers = {"Accept": "application/json"}
+    if payload is not None:
+        data = json.dumps(payload).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(
+        url, data=data, headers=headers, method="PUT" if data else "GET"
+    )
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+        return json.loads(resp.read().decode("utf-8", "replace"))
+
+
+def endpoint(device: dict, path: str) -> str:
+    return f"http://{device['host']}:{device.get('port', PORT)}/elgato/{path}"
+
+
+def call(
+    device: dict,
+    path: str,
+    method: str = "GET",
+    payload: dict | None = None,
+    body: bytes | None = None,
+    timeout: float = HTTP_TIMEOUT,
+) -> tuple[int, bytes]:
+    """Call an arbitrary /elgato/* endpoint. Returns (status, body).
+
+    Unlike request(), this does not parse JSON: several endpoints answer with an
+    empty body (identify, the firmware routes), and the status code is the
+    result. HTTPError is caught and returned as a status so callers can
+    distinguish "no such endpoint" (404) from "bad argument" (400) — the
+    difference between a feature this firmware lacks and one we called wrong.
+    """
+    headers = {"Accept": "application/json"}
+    data = body
+    if payload is not None:
+        data = json.dumps(payload).encode()
+        headers["Content-Type"] = "application/json"
+    elif body is not None:
+        headers["Content-Type"] = "application/octet-stream"
+    req = urllib.request.Request(
+        endpoint(device, path), data=data, headers=headers, method=method
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read() or b""
+
+
+def accessory_info(device: dict) -> dict:
+    """Fetch the display name / product name. Never raises."""
+    url = f"http://{device['host']}:{device.get('port', PORT)}/elgato/accessory-info"
+    try:
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            return json.loads(resp.read().decode("utf-8", "replace"))
+    except (OSError, ValueError):
+        return {}
+
+
+def set_display_name(device: dict, name: str) -> None:
+    """Write the persistent display name onto the light itself.
+
+    The name is stored in the light's own flash rather than in shell.json, so
+    it survives reboots, follows the light to another machine, and is the same
+    name Elgato's Control Center shows. Raises on failure; the caller reports it.
+    """
+    url = f"http://{device['host']}:{device.get('port', PORT)}/elgato/accessory-info"
+    body = json.dumps({"displayName": name}).encode()
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        method="PUT",
+    )
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+        resp.read()
+
+
+def light_view(device: dict, raw: dict) -> dict:
+    """Shape one device's reply into what the panel renders.
+
+    Both mired and kelvin are published so the QML never does the
+    conversion — the slider works in kelvin, the wire works in mired.
+    """
+    lights = raw.get("lights") or []
+    first = lights[0] if isinstance(lights, list) and lights else {}
+    if not isinstance(first, dict):
+        first = {}
+    brightness = clamp(first.get("brightness"), BRIGHTNESS_MIN, BRIGHTNESS_MAX, 0)
+    mired = clamp(first.get("temperature"), TEMP_MIN, TEMP_MAX, TEMP_MIN)
+    return {
+        "host": device["host"],
+        "port": device.get("port", PORT),
+        "name": device.get("name") or device["host"],
+        "reachable": True,
+        "on": bool(first.get("on")),
+        "brightness": brightness,
+        "temperature": mired,
+        "kelvin": mired_to_kelvin(mired),
+    }
+
+
+def unreachable_view(device: dict, error: Exception) -> dict:
+    """Placeholder row for a light that did not answer.
+
+    Kept in the list rather than dropped so a light that is merely asleep
+    does not silently vanish from the panel mid-session.
+    """
+    if isinstance(error, urllib.error.HTTPError):
+        message = f"HTTP {error.code}"
+    elif isinstance(error, ValueError):
+        message = "invalid response"
+    else:
+        reason = getattr(error, "reason", error)
+        message = str(reason) or error.__class__.__name__
+    return {
+        "host": device["host"],
+        "port": device.get("port", PORT),
+        "name": device.get("name") or device["host"],
+        "reachable": False,
+        "on": False,
+        "brightness": 0,
+        "temperature": TEMP_MIN,
+        "kelvin": mired_to_kelvin(TEMP_MIN),
+        "error": message,
+    }
+
+
+def fan_out(devices: list[dict], work) -> list[dict]:
+    """Run `work` against every device concurrently, preserving input order.
+
+    Concurrency is the point: a single unplugged light would otherwise add
+    its full timeout to the panel's refresh, and they add up serially.
+    """
+    if not devices:
+        return []
+    workers = min(MAX_PARALLEL, len(devices))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(work, devices))
+
+
+# ---------------------------------------------------------------- commands
+
+
+def cmd_discover(args) -> dict:
+    devices = discover()
+    # Resolve the user-facing name before caching so `state` can stay a single
+    # round trip per light on the warm path.
+    named = fan_out(devices, lambda d: {**d, "name": device_name(d)})
+    if named:
+        write_cache(named)
+    return {"ok": True, "devices": named, "count": len(named)}
+
+
+def device_name(device: dict) -> str:
+    """Prefer the user-set display name, then product name, then mDNS name."""
+    info = accessory_info(device)
+    for key in ("displayName", "productName"):
+        value = str(info.get(key) or "").strip()
+        if value:
+            return value
+    return device.get("name") or device["host"]
+
+
+def cmd_rename(args) -> dict:
+    """Set one light's persistent display name.
+
+    Requires an explicit --host: renaming is inherently per-device, and
+    applying one name to every light would be destructive rather than helpful.
+    """
+    device = parse_host(args.host)
+    name = str(args.name).strip()
+    if len(name) > 64:
+        # The firmware has its own limit; truncating beats a silent rejection.
+        name = name[:64]
+    try:
+        set_display_name(device, name)
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "error": str(getattr(exc, "reason", exc)) or "rename failed",
+                "host": device["host"]}
+    # Names are cached alongside the device list, so refresh it in place;
+    # otherwise the panel keeps the old label until the cache expires.
+    cached, _ = read_cache()
+    for entry in cached:
+        if entry.get("host") == device["host"]:
+            entry["name"] = name or device["host"]
+    if cached:
+        write_cache(cached)
+    return {"ok": True, "host": device["host"], "name": name}
+
+
+def cmd_identify(args) -> dict:
+    """Blink one light so the user can tell which physical light a row is.
+
+    Not every firmware has this route; a 404 is reported as unsupported rather
+    than as an error, because nothing is wrong with the light.
+    """
+    device = parse_host(args.host)
+    try:
+        status, _ = call(device, "identify", method="POST")
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "host": device["host"],
+                "error": str(getattr(exc, "reason", exc)) or "identify failed"}
+    if status == 404:
+        return {"ok": False, "host": device["host"], "supported": False,
+                "error": "this firmware has no identify command"}
+    if status >= 400:
+        return {"ok": False, "host": device["host"], "error": f"HTTP {status}"}
+    return {"ok": True, "host": device["host"], "supported": True}
+
+
+# ---------------------------------------------------------------- firmware
+
+
+def firmware_view(device: dict, info: dict, supported: bool | None) -> dict:
+    return {
+        "host": device["host"],
+        "port": device.get("port", PORT),
+        "name": (str(info.get("displayName") or "").strip()
+                 or str(info.get("productName") or "").strip()
+                 or device.get("name") or device["host"]),
+        "productName": str(info.get("productName") or ""),
+        "firmwareVersion": str(info.get("firmwareVersion") or ""),
+        "firmwareBuildNumber": info.get("firmwareBuildNumber"),
+        "hardwareBoardType": info.get("hardwareBoardType"),
+        "serialNumber": str(info.get("serialNumber") or ""),
+        "updateSupported": supported,
+    }
+
+
+def firmware_probe(device: dict) -> bool | None:
+    """Does this light expose the firmware-update routes?
+
+    Probed by PUTting an empty body to the data route: a device that has the
+    route answers 400 (bad argument), one that does not answers 404. This is
+    read-only — `prepare` is what erases flash, and we never touch it here.
+    None means the question could not be answered (the light did not reply).
+    """
+    try:
+        status, _ = call(
+            device, "firmware-update/data?offset=0", method="PUT", body=b""
+        )
+    except (OSError, ValueError):
+        return None
+    return status != 404
+
+
+def cmd_firmware(args) -> dict:
+    """Report each light's firmware, and whether it could be flashed.
+
+    Deliberately does not check for a newer version: Elgato publishes no
+    machine-readable firmware feed, and inventing one would mean claiming an
+    update exists when we cannot fetch it. Reporting what is installed lets the
+    user compare against Elgato's release notes themselves.
+    """
+    devices, _ = resolve_devices(args.host, False)
+    if not devices:
+        return {"ok": False, "error": "no-devices", "lights": []}
+
+    def read(device: dict) -> dict:
+        info = accessory_info(device)
+        if not info:
+            return {
+                "host": device["host"],
+                "port": device.get("port", PORT),
+                "name": device.get("name") or device["host"],
+                "reachable": False,
+                "error": "unreachable",
+            }
+        view = firmware_view(device, info, firmware_probe(device) if args.probe else None)
+        view["reachable"] = True
+        return view
+
+    lights = fan_out(devices, read)
+    return {"ok": True, "lights": lights, "count": len(lights)}
+
+
+def flash_firmware(device: dict, image: bytes, log=lambda msg: None) -> None:
+    """Write `image` to the light and reboot it into the new firmware.
+
+    Three phases, matching what Control Center does:
+      1. PUT  firmware-update/prepare  {"size": N}   - erases the staging area
+      2. PUT  firmware-update/data?offset=N          - raw chunks, in order
+      3. POST firmware-update/execute                - verify and reboot
+
+    Raises RuntimeError on any failure. Once `prepare` has been accepted the
+    light's staging flash is erased, so a failure between there and `execute`
+    leaves it needing another flash attempt — which is exactly why the caller
+    has to pass --yes.
+    """
+    size = len(image)
+    log(f"preparing {size} bytes")
+    status, body = call(
+        device, "firmware-update/prepare", method="PUT",
+        payload={"size": size}, timeout=FW_TIMEOUT,
+    )
+    if status >= 400:
+        raise RuntimeError(
+            f"prepare rejected (HTTP {status}) — this firmware may not support "
+            f"network updates{': ' + body.decode('utf-8', 'replace') if body else ''}"
+        )
+
+    sent = 0
+    while sent < size:
+        chunk = image[sent : sent + FW_CHUNK]
+        for attempt in range(FW_MAX_RETRIES):
+            try:
+                status, _ = call(
+                    device, f"firmware-update/data?offset={sent}",
+                    method="PUT", body=chunk, timeout=FW_TIMEOUT,
+                )
+            except OSError as exc:
+                # A dropped connection mid-flash is recoverable: the offset is
+                # explicit in the URL, so the same chunk can simply be resent.
+                if attempt == FW_MAX_RETRIES - 1:
+                    raise RuntimeError(
+                        f"lost the light at offset {sent}: "
+                        f"{getattr(exc, 'reason', exc)}"
+                    ) from exc
+                time.sleep(FW_CHUNK_DELAY * (attempt + 2))
+                continue
+            # Only 202 means the chunk was taken. 408 means the device is still
+            # writing the previous one, so back off and resend this offset.
+            if status == 202:
+                break
+            if attempt == FW_MAX_RETRIES - 1:
+                raise RuntimeError(f"chunk at offset {sent} rejected (HTTP {status})")
+            time.sleep(FW_CHUNK_DELAY * (attempt + 2))
+        sent += len(chunk)
+        if sent % (FW_CHUNK * 32) == 0 or sent >= size:
+            log(f"sent {sent}/{size} bytes ({sent * 100 // size}%)")
+        time.sleep(FW_CHUNK_DELAY)
+
+    log("verifying and rebooting")
+    status, body = call(
+        device, "firmware-update/execute", method="POST", timeout=FW_TIMEOUT
+    )
+    if status >= 400:
+        raise RuntimeError(
+            f"execute rejected (HTTP {status}) — the image was not accepted"
+            f"{': ' + body.decode('utf-8', 'replace') if body else ''}"
+        )
+
+
+def cmd_firmware_flash(args) -> dict:
+    """Flash a firmware image onto one light.
+
+    Gated hard, and never wired to the panel UI: Elgato distributes no firmware
+    images for download, the protocol has no rollback, and a failed flash needs
+    a successful retry to recover. This exists so someone who has extracted an
+    image from Control Center has a way to use it, not as a routine operation.
+    """
+    device = parse_host(args.host)
+
+    try:
+        with open(args.image, "rb") as fh:
+            image = fh.read()
+    except OSError as exc:
+        return {"ok": False, "error": f"cannot read image: {exc}"}
+
+    if not FW_MIN_SIZE <= len(image) <= FW_MAX_SIZE:
+        return {"ok": False, "error": (
+            f"{len(image)} bytes is outside the plausible range for a Key Light "
+            f"image ({FW_MIN_SIZE}-{FW_MAX_SIZE}); refusing to flash it"
+        )}
+
+    info = accessory_info(device)
+    if not info:
+        return {"ok": False, "error": "the light did not answer"}
+
+    if not args.yes:
+        return {"ok": False, "error": (
+            "refusing to flash without --yes. This overwrites the firmware on "
+            f"{info.get('productName') or device['host']} (currently "
+            f"{info.get('firmwareVersion')} build {info.get('firmwareBuildNumber')}) "
+            "and can leave the light unusable if it is interrupted or the image "
+            "is wrong. Keep the light powered and on the network throughout."
+        ), "before": firmware_view(device, info, None)}
+
+    steps: list[str] = []
+    try:
+        flash_firmware(device, image, steps.append)
+    except (RuntimeError, OSError, ValueError) as exc:
+        return {"ok": False, "error": str(getattr(exc, "reason", exc)),
+                "log": steps, "before": firmware_view(device, info, None)}
+
+    # The light reboots into the new image; wait for it rather than reporting
+    # success on a device that has not come back yet.
+    after = {}
+    deadline = time.time() + 90
+    while time.time() < deadline:
+        time.sleep(3)
+        after = accessory_info(device)
+        if after:
+            break
+
+    return {
+        "ok": True,
+        "log": steps,
+        "before": firmware_view(device, info, None),
+        "after": firmware_view(device, after, None) if after else None,
+        "warning": None if after else (
+            "flash reported success but the light has not answered since "
+            "rebooting; give it a minute, then power-cycle it"
+        ),
+    }
+
+
+def cmd_state(args) -> dict:
+    devices, discovered = resolve_devices(args.host, args.refresh)
+    if not devices:
+        return {
+            "ok": True,
+            "lights": [],
+            "count": 0,
+            "discovered": discovered,
+            "error": "no-devices",
+        }
+
+    # An explicit --host carries no name, and a cache written by an older
+    # version may predate name resolution. Fetch those names once here so the
+    # panel always has a real label instead of a bare IP address.
+    unnamed = [d for d in devices if not d.get("name")]
+
+    def read(device: dict) -> dict:
+        try:
+            if not device.get("name"):
+                device = {**device, "name": device_name(device)}
+            return light_view(device, request(device))
+        except (OSError, ValueError) as exc:
+            return unreachable_view(device, exc)
+
+    lights = fan_out(devices, read)
+
+    # Persist any names we just had to look up, so the next refresh is cheap.
+    if unnamed and not args.host:
+        resolved = {l["host"]: l["name"] for l in lights if l.get("reachable")}
+        if resolved:
+            cached, _ = read_cache()
+            for entry in cached:
+                if not entry.get("name") and entry.get("host") in resolved:
+                    entry["name"] = resolved[entry["host"]]
+            if cached:
+                write_cache(cached)
+
+    return {
+        "ok": True,
+        "lights": lights,
+        "count": len(lights),
+        "discovered": discovered,
+        "anyOn": any(l["on"] for l in lights if l["reachable"]),
+        "reachable": sum(1 for l in lights if l["reachable"]),
+    }
+
+
+def build_patch(args, current: dict | None) -> dict:
+    """Assemble the per-light PUT body.
+
+    Only the fields the user asked to change are sent. `--toggle` needs the
+    light's current value, so it is resolved per-device by the caller.
+    """
+    patch: dict[str, int] = {}
+    if args.on:
+        patch["on"] = 1
+    elif args.off:
+        patch["on"] = 0
+    elif args.toggle:
+        # No reading means no basis for a toggle; leaving `on` out makes this
+        # a no-op for that light rather than a guess at the wrong direction.
+        if current is not None:
+            patch["on"] = 0 if current.get("on") else 1
+
+    if args.brightness is not None:
+        value = clamp(args.brightness, BRIGHTNESS_MIN, BRIGHTNESS_MAX)
+        if value is not None:
+            patch["brightness"] = value
+
+    if args.kelvin is not None:
+        value = kelvin_to_mired(args.kelvin)
+        if value is not None:
+            patch["temperature"] = value
+    elif args.temperature is not None:
+        value = clamp(args.temperature, TEMP_MIN, TEMP_MAX)
+        if value is not None:
+            patch["temperature"] = value
+
+    return patch
+
+
+def cmd_set(args) -> dict:
+    devices, _ = resolve_devices(args.host, False)
+    if not devices:
+        return {"ok": False, "error": "no-devices", "lights": [], "count": 0}
+
+    needs_current = args.toggle
+
+    def apply(device: dict) -> dict:
+        try:
+            current = light_view(device, request(device)) if needs_current else None
+            patch = build_patch(args, current)
+            if not patch:
+                # Nothing to change: report the light as-is instead of
+                # sending an empty PUT the firmware would echo back.
+                return current or light_view(device, request(device))
+            reply = request(device, {"numberOfLights": 1, "lights": [patch]})
+            return light_view(device, reply)
+        except (OSError, ValueError) as exc:
+            return unreachable_view(device, exc)
+
+    lights = fan_out(devices, apply)
+    failed = [l for l in lights if not l["reachable"]]
+    return {
+        "ok": not failed,
+        "lights": lights,
+        "count": len(lights),
+        "anyOn": any(l["on"] for l in lights if l["reachable"]),
+        "reachable": len(lights) - len(failed),
+        **({"error": "unreachable"} if failed else {}),
+    }
+
+
+# ---------------------------------------------------------------- entry point
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="keylight", description="Control Elgato Key Lights."
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    def add_hosts(p):
+        p.add_argument(
+            "--host",
+            action="append",
+            default=[],
+            metavar="ADDR[:PORT]",
+            help="target a light directly, skipping mDNS (repeatable)",
+        )
+
+    p_discover = sub.add_parser("discover", help="scan the network for lights")
+    p_discover.set_defaults(fn=cmd_discover)
+
+    p_state = sub.add_parser("state", help="read current light state")
+    add_hosts(p_state)
+    p_state.add_argument(
+        "--refresh", action="store_true", help="force an mDNS rescan first"
+    )
+    p_state.set_defaults(fn=cmd_state)
+
+    p_set = sub.add_parser("set", help="change light state")
+    add_hosts(p_set)
+    power = p_set.add_mutually_exclusive_group()
+    power.add_argument("--on", action="store_true", help="switch on")
+    power.add_argument("--off", action="store_true", help="switch off")
+    power.add_argument("--toggle", action="store_true", help="invert current power")
+    p_set.add_argument("--brightness", type=float, metavar="PCT", help="0-100")
+    temp = p_set.add_mutually_exclusive_group()
+    temp.add_argument("--kelvin", type=float, metavar="K", help="2900-7000")
+    temp.add_argument(
+        "--temperature", type=float, metavar="MIRED", help="143-344 (raw wire units)"
+    )
+    p_set.set_defaults(fn=cmd_set)
+
+    p_identify = sub.add_parser("identify", help="blink a light to locate it")
+    p_identify.add_argument("--host", required=True, metavar="ADDR[:PORT]",
+                            help="the light to blink")
+    p_identify.set_defaults(fn=cmd_identify)
+
+    p_fw = sub.add_parser("firmware", help="report installed firmware versions")
+    add_hosts(p_fw)
+    p_fw.add_argument(
+        "--probe", action="store_true",
+        help="also check whether the light exposes the network update routes",
+    )
+    p_fw.set_defaults(fn=cmd_firmware)
+
+    p_flash = sub.add_parser(
+        "firmware-flash",
+        help="write a firmware image to one light (dangerous; needs --yes)",
+    )
+    p_flash.add_argument("--host", required=True, metavar="ADDR[:PORT]",
+                         help="the light to flash")
+    p_flash.add_argument("image", help="path to the firmware image")
+    p_flash.add_argument(
+        "--yes", action="store_true",
+        help="confirm you accept the risk of an interrupted flash",
+    )
+    p_flash.set_defaults(fn=cmd_firmware_flash)
+
+    p_rename = sub.add_parser("rename", help="set a light's persistent name")
+    p_rename.add_argument("--host", required=True, metavar="ADDR[:PORT]",
+                          help="the light to rename")
+    p_rename.add_argument("name", help="new display name (empty string clears it)")
+    p_rename.set_defaults(fn=cmd_rename)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        result = args.fn(args)
+    except Exception as exc:  # noqa: BLE001 - last line of defense
+        # The panel parses stdout as JSON unconditionally. An unhandled
+        # traceback on stderr with empty stdout would render as a mystery
+        # blank widget, so every failure leaves as a JSON object.
+        result = {"ok": False, "error": f"{exc.__class__.__name__}: {exc}"}
+    json.dump(result, sys.stdout)
+    sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
