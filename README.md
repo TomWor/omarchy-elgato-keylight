@@ -32,14 +32,14 @@ first-party ones.
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/nille/omarchy-elgato-keylight
+omarchy plugin add https://github.com/nille/omarchy-elgato-keylight --enable
 ```
 
-Then add it to the bar via **Omarchy menu → Bar → Widgets**, or by hand in
-`~/.config/omarchy/shell.json`:
+`--enable` puts it straight into the bar's right section. Without it, add it
+later via **Omarchy menu → Bar → Widgets**, or with:
 
-```json
-{ "id": "nille.elgato-keylight" }
+```bash
+omarchy plugin enable nille.elgato-keylight --section right
 ```
 
 No build step, no compiled binary, and nothing to install as root. The helper is
@@ -70,6 +70,17 @@ end to end.
   "groupMode": false
 }
 ```
+
+Or from the CLI, without editing the file:
+
+```bash
+omarchy bar set nille.elgato-keylight hosts "192.168.1.10, 192.168.1.11"
+omarchy bar set nille.elgato-keylight refreshIntervalSec 60 --json
+omarchy bar set nille.elgato-keylight groupMode false --json
+```
+
+`--json` is what distinguishes the number `60` and the boolean `false` from the
+strings `"60"` and `"false"`.
 
 ## Using it
 
@@ -126,7 +137,7 @@ scripts/keylight set --brightness 60 --kelvin 4500         # all of them
 scripts/keylight set --host 192.168.1.10 --off             # just one
 scripts/keylight rename --host 192.168.1.10 "Left Key"
 scripts/keylight identify --host 192.168.1.10
-scripts/keylight firmware --probe                          # installed versions
+scripts/keylight firmware                                  # installed versions
 ```
 
 Every subcommand exits 0 and reports failure as `{"ok": false, "error": ...}`,
@@ -147,6 +158,13 @@ downloadable images, so such a control would behave identically whether you were
 current or three versions behind — a notification carrying no information is
 worse than no notification.
 
+`--probe` additionally reports whether a light exposes the network update routes
+at all:
+
+```bash
+scripts/keylight firmware --probe
+```
+
 `scripts/keylight firmware-flash` implements the light's own network update
 protocol (`prepare` → chunked `data` → `execute`), so if you have obtained an
 image you can write it without Windows or macOS. It is **not** exposed in the
@@ -161,16 +179,19 @@ flash, or the wrong image, leaves the light needing a successful retry to
 recover. Elgato's supported path is Control Center on Windows, macOS, iOS, or
 Android; use that unless you have a reason not to.
 
-## How it works
+## Files
 
-```
-Panel.qml    presentation, cursor model, theming — every control is a qs.Ui
-             component, so nothing about the look is hardcoded here
-Model.js     pure functions: parsing, clamping, labels, argv building. No QML
-             types, no state, no side effects — which is what makes it testable
-scripts/     the helper CLI: mDNS discovery, HTTP, concurrency
-tests/       89 unit tests over the helper
-```
+- `manifest.json` — plugin id, bar widget metadata, settings schema and defaults
+- `Panel.qml` — bar glyph, popout, cursor model, IPC. Every control is a `qs.Ui`
+  component, so nothing about the look is hardcoded here
+- `Model.js` — pure functions: parsing, clamping, labels, argv building. No QML
+  types, no state, no side effects, which is what makes it testable
+- `scripts/keylight` — the helper CLI: mDNS discovery, HTTP, concurrency
+- `tests/test_keylight.py` — 89 unit tests over the helper
+- `tests/harness/shell.qml` — standalone window for developing the panel without
+  a running Omarchy shell
+
+## How it works
 
 Lights speak HTTP on port 9123 and advertise themselves as `_elg._tcp`.
 Temperature travels the wire in mired (`mired = 1e6 / kelvin`); the panel works
@@ -184,13 +205,27 @@ hardware shortly after, so the slider tracks your finger but still ends up
 showing what the firmware actually accepted — including changes made from
 another app.
 
-## Testing
+## Verify
 
 ```bash
-python3 -m unittest discover -s tests -v
+omarchy plugin validate .
+python3 -m unittest discover -s tests
 ```
 
-Nothing in the suite touches a real light.
+`plugin validate` runs the same manifest checks the shell enforces at load time,
+so it fails before an install does. The unit tests never touch a real light.
+
+To work on the panel itself without installing it, the harness stands in for the
+bar:
+
+```bash
+quickshell -p tests/harness/shell.qml
+```
+
+Note that `omarchy plugin add` and `plugin validate` both refuse symlinks
+anywhere inside a plugin folder, so a working tree has to be copied into
+`~/.config/omarchy/plugins/` rather than linked — the harness exists to avoid
+needing that at all.
 
 ## A note on the network API
 
