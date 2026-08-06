@@ -47,6 +47,17 @@ a single Python 3 standard-library script, which is what lets `omarchy plugin
 add` — which deliberately never runs plugin code or install hooks — set this up
 end to end.
 
+### Uninstall
+
+```bash
+omarchy plugin remove nille.elgato-keylight
+```
+
+Nothing is left behind: no daemon, no unit file, no state outside the plugin
+directory and its entry in `~/.config/omarchy/shell.json`. Names you set live on
+the lights themselves, so they survive uninstalling — and reappear in Elgato's
+own apps.
+
 ### Requirements
 
 - Omarchy 4 (the Quickshell bar)
@@ -228,6 +239,23 @@ hardware rather than of this plugin — see
 [CVE-2025-7202](https://www.toreon.com/flashing-your-lights-cve-2025-7202/).
 Anything on your network can already control your lights. Worth knowing if you
 run one on a network you do not trust.
+
+## Contributing
+
+Issues and pull requests are welcome. Two things worth knowing before you start:
+
+- **Only one Key Light was available to develop against.** Multi-light behavior
+  is covered by unit tests and by mocking the helper, not by hardware. If you own
+  several, reports about group mode and per-light rows are the most useful thing
+  you can send — especially mixed states across different firmware versions.
+- **Keep logic out of QML.** Parsing, clamping, and argv building belong in
+  `Model.js` as pure functions, which is what makes them testable without a
+  running shell. `Panel.qml` should stay presentation.
+
+Run `python3 -m unittest discover -s tests` and `omarchy plugin validate .`
+before opening a PR. Please do not hardcode colors, fonts, or spacing — every
+value comes from the active Omarchy theme via `qs.Ui`, and a literal breaks
+theming for everyone else.
 
 ## License
 
