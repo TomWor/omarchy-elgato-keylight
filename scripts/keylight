@@ -12,8 +12,7 @@ Subcommands:
   set                   mutate lights (--on/--off/--toggle/--brightness/--temperature)
   rename                set a light's persistent display name
   identify              blink a light so you can tell which one it is
-  firmware              report firmware version and whether an update is possible
-  firmware-flash        write a firmware image to one light (requires --yes)
+  firmware              report each light's installed firmware version
 
 Devices come from --host (repeatable) when given, otherwise from mDNS
 discovery cached in $XDG_CACHE_HOME/omarchy-elgato-keylight/devices.json. Discovery is the
@@ -62,24 +61,6 @@ HTTP_TIMEOUT = 2.5      # per-request; a sleeping light on wifi answers in ~50ms
 DISCOVER_TIMEOUT = 6.0
 CACHE_TTL = 300         # seconds before the device cache is considered stale
 MAX_PARALLEL = 8
-
-# ---- firmware flashing ----
-# Control Center's own chunk size, reproduced from a capture of its update
-# traffic. The firmware's receive buffer is sized for it; larger chunks are
-# rejected outright.
-FW_CHUNK = 4096
-# There is no flow control on the wire beyond the device answering 408 when it
-# is still flushing the previous chunk, so pace the writes rather than relying
-# on backpressure that does not exist.
-FW_CHUNK_DELAY = 0.025
-# Per-chunk retry budget. Control Center gives up around 10-15 consecutive
-# timeouts; matching that means a genuinely wedged device fails fast instead of
-# looping for minutes over a link that is not going to recover.
-FW_MAX_RETRIES = 12
-FW_TIMEOUT = 10.0       # prepare erases flash and execute reboots: both are slow
-# Sanity bounds on the image. A Key Light image is ~750KB; anything far outside
-# that is a wrong file, and refusing it is cheaper than half-flashing a light.
-FW_MIN_SIZE, FW_MAX_SIZE = 64 * 1024, 8 * 1024 * 1024
 
 
 def cache_path() -> str:
@@ -285,11 +266,11 @@ def call(
 ) -> tuple[int, bytes]:
     """Call an arbitrary /elgato/* endpoint. Returns (status, body).
 
-    Unlike request(), this does not parse JSON: several endpoints answer with an
-    empty body (identify, the firmware routes), and the status code is the
-    result. HTTPError is caught and returned as a status so callers can
-    distinguish "no such endpoint" (404) from "bad argument" (400) — the
-    difference between a feature this firmware lacks and one we called wrong.
+    Unlike request(), this does not parse JSON: some endpoints answer with an
+    empty body (identify), and the status code is the result. HTTPError is
+    caught and returned as a status so callers can distinguish "no such
+    endpoint" (404) from "bad argument" (400) — the difference between a feature
+    this firmware lacks and one we called wrong.
     """
     headers = {"Accept": "application/json"}
     data = body
@@ -474,7 +455,7 @@ def cmd_identify(args) -> dict:
 # ---------------------------------------------------------------- firmware
 
 
-def firmware_view(device: dict, info: dict, supported: bool | None) -> dict:
+def firmware_view(device: dict, info: dict) -> dict:
     return {
         "host": device["host"],
         "port": device.get("port", PORT),
@@ -486,34 +467,19 @@ def firmware_view(device: dict, info: dict, supported: bool | None) -> dict:
         "firmwareBuildNumber": info.get("firmwareBuildNumber"),
         "hardwareBoardType": info.get("hardwareBoardType"),
         "serialNumber": str(info.get("serialNumber") or ""),
-        "updateSupported": supported,
     }
 
 
-def firmware_probe(device: dict) -> bool | None:
-    """Does this light expose the firmware-update routes?
-
-    Probed by PUTting an empty body to the data route: a device that has the
-    route answers 400 (bad argument), one that does not answers 404. This is
-    read-only — `prepare` is what erases flash, and we never touch it here.
-    None means the question could not be answered (the light did not reply).
-    """
-    try:
-        status, _ = call(
-            device, "firmware-update/data?offset=0", method="PUT", body=b""
-        )
-    except (OSError, ValueError):
-        return None
-    return status != 404
-
-
 def cmd_firmware(args) -> dict:
-    """Report each light's firmware, and whether it could be flashed.
+    """Report each light's installed firmware version.
 
     Deliberately does not check for a newer version: Elgato publishes no
     machine-readable firmware feed, and inventing one would mean claiming an
     update exists when we cannot fetch it. Reporting what is installed lets the
     user compare against Elgato's release notes themselves.
+
+    Updating is Control Center's job — the phone apps do it over Bluetooth and
+    need no desktop at all — so this stays read-only by design.
     """
     devices, _ = resolve_devices(args.host, False)
     if not devices:
@@ -529,143 +495,12 @@ def cmd_firmware(args) -> dict:
                 "reachable": False,
                 "error": "unreachable",
             }
-        view = firmware_view(device, info, firmware_probe(device) if args.probe else None)
+        view = firmware_view(device, info)
         view["reachable"] = True
         return view
 
     lights = fan_out(devices, read)
     return {"ok": True, "lights": lights, "count": len(lights)}
-
-
-def flash_firmware(device: dict, image: bytes, log=lambda msg: None) -> None:
-    """Write `image` to the light and reboot it into the new firmware.
-
-    Three phases, matching what Control Center does:
-      1. PUT  firmware-update/prepare  {"size": N}   - erases the staging area
-      2. PUT  firmware-update/data?offset=N          - raw chunks, in order
-      3. POST firmware-update/execute                - verify and reboot
-
-    Raises RuntimeError on any failure. Once `prepare` has been accepted the
-    light's staging flash is erased, so a failure between there and `execute`
-    leaves it needing another flash attempt — which is exactly why the caller
-    has to pass --yes.
-    """
-    size = len(image)
-    log(f"preparing {size} bytes")
-    status, body = call(
-        device, "firmware-update/prepare", method="PUT",
-        payload={"size": size}, timeout=FW_TIMEOUT,
-    )
-    if status >= 400:
-        raise RuntimeError(
-            f"prepare rejected (HTTP {status}) — this firmware may not support "
-            f"network updates{': ' + body.decode('utf-8', 'replace') if body else ''}"
-        )
-
-    sent = 0
-    while sent < size:
-        chunk = image[sent : sent + FW_CHUNK]
-        for attempt in range(FW_MAX_RETRIES):
-            try:
-                status, _ = call(
-                    device, f"firmware-update/data?offset={sent}",
-                    method="PUT", body=chunk, timeout=FW_TIMEOUT,
-                )
-            except OSError as exc:
-                # A dropped connection mid-flash is recoverable: the offset is
-                # explicit in the URL, so the same chunk can simply be resent.
-                if attempt == FW_MAX_RETRIES - 1:
-                    raise RuntimeError(
-                        f"lost the light at offset {sent}: "
-                        f"{getattr(exc, 'reason', exc)}"
-                    ) from exc
-                time.sleep(FW_CHUNK_DELAY * (attempt + 2))
-                continue
-            # Only 202 means the chunk was taken. 408 means the device is still
-            # writing the previous one, so back off and resend this offset.
-            if status == 202:
-                break
-            if attempt == FW_MAX_RETRIES - 1:
-                raise RuntimeError(f"chunk at offset {sent} rejected (HTTP {status})")
-            time.sleep(FW_CHUNK_DELAY * (attempt + 2))
-        sent += len(chunk)
-        if sent % (FW_CHUNK * 32) == 0 or sent >= size:
-            log(f"sent {sent}/{size} bytes ({sent * 100 // size}%)")
-        time.sleep(FW_CHUNK_DELAY)
-
-    log("verifying and rebooting")
-    status, body = call(
-        device, "firmware-update/execute", method="POST", timeout=FW_TIMEOUT
-    )
-    if status >= 400:
-        raise RuntimeError(
-            f"execute rejected (HTTP {status}) — the image was not accepted"
-            f"{': ' + body.decode('utf-8', 'replace') if body else ''}"
-        )
-
-
-def cmd_firmware_flash(args) -> dict:
-    """Flash a firmware image onto one light.
-
-    Gated hard, and never wired to the panel UI: Elgato distributes no firmware
-    images for download, the protocol has no rollback, and a failed flash needs
-    a successful retry to recover. This exists so someone who has extracted an
-    image from Control Center has a way to use it, not as a routine operation.
-    """
-    device = parse_host(args.host)
-
-    try:
-        with open(args.image, "rb") as fh:
-            image = fh.read()
-    except OSError as exc:
-        return {"ok": False, "error": f"cannot read image: {exc}"}
-
-    if not FW_MIN_SIZE <= len(image) <= FW_MAX_SIZE:
-        return {"ok": False, "error": (
-            f"{len(image)} bytes is outside the plausible range for a Key Light "
-            f"image ({FW_MIN_SIZE}-{FW_MAX_SIZE}); refusing to flash it"
-        )}
-
-    info = accessory_info(device)
-    if not info:
-        return {"ok": False, "error": "the light did not answer"}
-
-    if not args.yes:
-        return {"ok": False, "error": (
-            "refusing to flash without --yes. This overwrites the firmware on "
-            f"{info.get('productName') or device['host']} (currently "
-            f"{info.get('firmwareVersion')} build {info.get('firmwareBuildNumber')}) "
-            "and can leave the light unusable if it is interrupted or the image "
-            "is wrong. Keep the light powered and on the network throughout."
-        ), "before": firmware_view(device, info, None)}
-
-    steps: list[str] = []
-    try:
-        flash_firmware(device, image, steps.append)
-    except (RuntimeError, OSError, ValueError) as exc:
-        return {"ok": False, "error": str(getattr(exc, "reason", exc)),
-                "log": steps, "before": firmware_view(device, info, None)}
-
-    # The light reboots into the new image; wait for it rather than reporting
-    # success on a device that has not come back yet.
-    after = {}
-    deadline = time.time() + 90
-    while time.time() < deadline:
-        time.sleep(3)
-        after = accessory_info(device)
-        if after:
-            break
-
-    return {
-        "ok": True,
-        "log": steps,
-        "before": firmware_view(device, info, None),
-        "after": firmware_view(device, after, None) if after else None,
-        "warning": None if after else (
-            "flash reported success but the light has not answered since "
-            "rebooting; give it a minute, then power-cycle it"
-        ),
-    }
 
 
 def cmd_state(args) -> dict:
@@ -830,24 +665,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_fw = sub.add_parser("firmware", help="report installed firmware versions")
     add_hosts(p_fw)
-    p_fw.add_argument(
-        "--probe", action="store_true",
-        help="also check whether the light exposes the network update routes",
-    )
     p_fw.set_defaults(fn=cmd_firmware)
-
-    p_flash = sub.add_parser(
-        "firmware-flash",
-        help="write a firmware image to one light (dangerous; needs --yes)",
-    )
-    p_flash.add_argument("--host", required=True, metavar="ADDR[:PORT]",
-                         help="the light to flash")
-    p_flash.add_argument("image", help="path to the firmware image")
-    p_flash.add_argument(
-        "--yes", action="store_true",
-        help="confirm you accept the risk of an interrupted flash",
-    )
-    p_flash.set_defaults(fn=cmd_firmware_flash)
 
     p_rename = sub.add_parser("rename", help="set a light's persistent name")
     p_rename.add_argument("--host", required=True, metavar="ADDR[:PORT]",

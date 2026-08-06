@@ -51,8 +51,15 @@ end to end.
 
 - Omarchy 4 (the Quickshell bar)
 - Python 3.9+ (already present on Omarchy)
-- `avahi-daemon` running, for automatic discovery. Optional — you can pin
-  addresses instead.
+- `avahi-daemon` running, for automatic discovery. Omarchy installs `avahi` as
+  part of its base packages, but only *enables* the daemon if you set up a
+  printer, so it may be present and inactive:
+
+  ```bash
+  systemctl is-active avahi-daemon || sudo systemctl enable --now avahi-daemon
+  ```
+
+  Optional either way — set `hosts` to pin addresses instead.
 
 ## Settings
 
@@ -158,26 +165,11 @@ downloadable images, so such a control would behave identically whether you were
 current or three versions behind — a notification carrying no information is
 worse than no notification.
 
-`--probe` additionally reports whether a light exposes the network update routes
-at all:
-
-```bash
-scripts/keylight firmware --probe
-```
-
-`scripts/keylight firmware-flash` implements the light's own network update
-protocol (`prepare` → chunked `data` → `execute`), so if you have obtained an
-image you can write it without Windows or macOS. It is **not** exposed in the
-panel UI, and requires `--yes`:
-
-```bash
-scripts/keylight firmware-flash --host 192.168.1.10 keylight.bin --yes
-```
-
-There is no rollback and no signature you can verify beforehand. An interrupted
-flash, or the wrong image, leaves the light needing a successful retry to
-recover. Elgato's supported path is Control Center on Windows, macOS, iOS, or
-Android; use that unless you have a reason not to.
+Updating is deliberately out of scope, and the helper has no flash command. The
+Elgato phone apps update over Bluetooth and need no desktop at all, which is the
+easiest supported path; Control Center on Windows or macOS also works. Reporting
+the version stays strictly read-only, because the light's own update routes erase
+its staging flash just by being addressed.
 
 ## Files
 
@@ -187,7 +179,7 @@ Android; use that unless you have a reason not to.
 - `Model.js` — pure functions: parsing, clamping, labels, argv building. No QML
   types, no state, no side effects, which is what makes it testable
 - `scripts/keylight` — the helper CLI: mDNS discovery, HTTP, concurrency
-- `tests/test_keylight.py` — 89 unit tests over the helper
+- `tests/test_keylight.py` — 71 unit tests over the helper
 - `tests/harness/shell.qml` — standalone window for developing the panel without
   a running Omarchy shell
 

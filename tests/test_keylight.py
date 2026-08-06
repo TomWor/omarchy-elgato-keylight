@@ -520,29 +520,6 @@ class TestIdentify(unittest.TestCase):
         self.assertEqual(called.call_args.kwargs["method"], "POST")
 
 
-class TestFirmwareProbe(unittest.TestCase):
-    """400 vs 404 is the whole signal: the device answers 400 to an empty body
-    on a route it has, and 404 on one it does not."""
-
-    def test_400_means_route_exists(self):
-        with mock.patch.object(g, "call", return_value=(400, b"")):
-            self.assertIs(g.firmware_probe(DEVICE), True)
-
-    def test_404_means_unsupported(self):
-        with mock.patch.object(g, "call", return_value=(404, b"")):
-            self.assertIs(g.firmware_probe(DEVICE), False)
-
-    def test_unreachable_is_unknown_not_false(self):
-        with mock.patch.object(g, "call", side_effect=OSError("timed out")):
-            self.assertIsNone(g.firmware_probe(DEVICE))
-
-    def test_probe_never_calls_prepare(self):
-        # prepare() erases the staging flash. A read-only probe must not touch it.
-        with mock.patch.object(g, "call", return_value=(400, b"")) as called:
-            g.firmware_probe(DEVICE)
-        self.assertNotIn("prepare", called.call_args.args[1])
-
-
 class TestFirmwareReport(unittest.TestCase):
     INFO = {
         "productName": "Elgato Key Light",
@@ -556,24 +533,25 @@ class TestFirmwareReport(unittest.TestCase):
     def test_reports_versions(self):
         with mock.patch.object(g, "accessory_info", return_value=self.INFO), \
              mock.patch.object(g, "resolve_devices", return_value=([DEVICE], False)):
-            out = g.cmd_firmware(Args(host=["10.0.0.5"], probe=False))
+            out = g.cmd_firmware(Args(host=["10.0.0.5"]))
         light = out["lights"][0]
         self.assertEqual(light["firmwareVersion"], "1.0.3")
         self.assertEqual(light["firmwareBuildNumber"], 222)
         self.assertTrue(light["reachable"])
 
-    def test_skips_probe_unless_asked(self):
+    def test_is_read_only(self):
+        # Reporting a version must never poke a write endpoint: the light's
+        # update routes erase its staging flash just by being addressed.
         with mock.patch.object(g, "accessory_info", return_value=self.INFO), \
              mock.patch.object(g, "resolve_devices", return_value=([DEVICE], False)), \
-             mock.patch.object(g, "firmware_probe") as probe:
-            out = g.cmd_firmware(Args(host=["10.0.0.5"], probe=False))
-        probe.assert_not_called()
-        self.assertIsNone(out["lights"][0]["updateSupported"])
+             mock.patch.object(g, "call") as called:
+            g.cmd_firmware(Args(host=["10.0.0.5"]))
+        called.assert_not_called()
 
     def test_unreachable_light_is_a_row_not_a_failure(self):
         with mock.patch.object(g, "accessory_info", return_value={}), \
              mock.patch.object(g, "resolve_devices", return_value=([DEVICE], False)):
-            out = g.cmd_firmware(Args(host=["10.0.0.5"], probe=True))
+            out = g.cmd_firmware(Args(host=["10.0.0.5"]))
         self.assertTrue(out["ok"])
         self.assertFalse(out["lights"][0]["reachable"])
 
@@ -581,206 +559,8 @@ class TestFirmwareReport(unittest.TestCase):
         info = {**self.INFO, "displayName": "Left Key"}
         with mock.patch.object(g, "accessory_info", return_value=info), \
              mock.patch.object(g, "resolve_devices", return_value=([DEVICE], False)):
-            out = g.cmd_firmware(Args(host=["10.0.0.5"], probe=False))
+            out = g.cmd_firmware(Args(host=["10.0.0.5"]))
         self.assertEqual(out["lights"][0]["name"], "Left Key")
-
-
-class TestFlashFirmware(unittest.TestCase):
-    """The flash protocol. These are the tests that matter most: every failure
-    mode here is one that can leave a light needing a re-flash to recover."""
-
-    def setUp(self):
-        # Real timing would make the suite take minutes; the delays are pacing,
-        # not logic, so stub them out.
-        patcher = mock.patch.object(g.time, "sleep")
-        patcher.start()
-        self.addCleanup(patcher.stop)
-
-    def test_sends_prepare_then_chunks_then_execute(self):
-        image = b"x" * (g.FW_CHUNK * 2 + 17)
-        calls = []
-
-        def fake(device, path, method="GET", payload=None, body=None, timeout=None):
-            calls.append((method, path, payload, len(body) if body else 0))
-            return (202 if "data" in path else 200), b""
-
-        with mock.patch.object(g, "call", side_effect=fake):
-            g.flash_firmware(DEVICE, image)
-
-        self.assertEqual(calls[0][:3], ("PUT", "firmware-update/prepare",
-                                        {"size": len(image)}))
-        self.assertEqual(calls[-1][:2], ("POST", "firmware-update/execute"))
-        # Offsets must be contiguous and cover the image exactly once.
-        offsets = [int(p.split("offset=")[1]) for _, p, _, _ in calls if "data" in p]
-        sizes = [n for _, p, _, n in calls if "data" in p]
-        self.assertEqual(offsets, [0, g.FW_CHUNK, g.FW_CHUNK * 2])
-        self.assertEqual(sizes, [g.FW_CHUNK, g.FW_CHUNK, 17])
-        self.assertEqual(sum(sizes), len(image))
-
-    def test_408_retries_the_same_offset(self):
-        # 408 means "still flushing the last chunk", not "chunk lost".
-        image = b"y" * g.FW_CHUNK
-        replies = iter([(200, b""), (408, b""), (408, b""), (202, b""), (200, b"")])
-        seen = []
-
-        def fake(device, path, method="GET", payload=None, body=None, timeout=None):
-            seen.append(path)
-            return next(replies)
-
-        with mock.patch.object(g, "call", side_effect=fake):
-            g.flash_firmware(DEVICE, image)
-        data_calls = [p for p in seen if "data" in p]
-        self.assertEqual(data_calls, ["firmware-update/data?offset=0"] * 3)
-
-    def test_dropped_connection_resends_same_offset(self):
-        image = b"z" * g.FW_CHUNK
-        replies = [(200, b""), OSError("connection reset"), (202, b""), (200, b"")]
-        it = iter(replies)
-
-        def fake(*a, **kw):
-            item = next(it)
-            if isinstance(item, Exception):
-                raise item
-            return item
-
-        with mock.patch.object(g, "call", side_effect=fake):
-            g.flash_firmware(DEVICE, image)  # must not raise
-
-    def test_only_202_counts_as_accepted(self):
-        # A 200 on a data chunk is not an acknowledgement; treating it as one
-        # would silently skip a chunk and produce a corrupt image.
-        image = b"q" * g.FW_CHUNK
-
-        def fake(device, path, method="GET", payload=None, body=None, timeout=None):
-            return (200, b"") if "data" in path else (200, b"")
-
-        with mock.patch.object(g, "call", side_effect=fake):
-            with self.assertRaises(RuntimeError) as ctx:
-                g.flash_firmware(DEVICE, image)
-        self.assertIn("offset 0", str(ctx.exception))
-
-    def test_gives_up_after_retry_budget(self):
-        image = b"w" * g.FW_CHUNK
-
-        def fake(device, path, method="GET", payload=None, body=None, timeout=None):
-            return (408, b"") if "data" in path else (200, b"")
-
-        with mock.patch.object(g, "call", side_effect=fake) as called:
-            with self.assertRaises(RuntimeError):
-                g.flash_firmware(DEVICE, image)
-        data_calls = [c for c in called.call_args_list if "data" in c.args[1]]
-        self.assertEqual(len(data_calls), g.FW_MAX_RETRIES)
-
-    def test_rejected_prepare_aborts_before_sending_anything(self):
-        with mock.patch.object(g, "call", return_value=(404, b"")) as called:
-            with self.assertRaises(RuntimeError) as ctx:
-                g.flash_firmware(DEVICE, b"a" * g.FW_CHUNK)
-        self.assertIn("prepare rejected", str(ctx.exception))
-        self.assertEqual(called.call_count, 1)
-
-    def test_rejected_execute_is_reported(self):
-        def fake(device, path, method="GET", payload=None, body=None, timeout=None):
-            if "prepare" in path:
-                return 200, b""
-            if "data" in path:
-                return 202, b""
-            return 400, b"bad signature"
-
-        with mock.patch.object(g, "call", side_effect=fake):
-            with self.assertRaises(RuntimeError) as ctx:
-                g.flash_firmware(DEVICE, b"a" * g.FW_CHUNK)
-        self.assertIn("not accepted", str(ctx.exception))
-        self.assertIn("bad signature", str(ctx.exception))
-
-
-class TestFlashCommandGuards(unittest.TestCase):
-    """The command wrapper. Every one of these guards has to fire *before*
-    prepare() erases the light's flash."""
-
-    def setUp(self):
-        fd, self.path = tempfile.mkstemp()
-        os.close(fd)
-        self.addCleanup(lambda: os.unlink(self.path))
-
-    def write(self, size):
-        with open(self.path, "wb") as fh:
-            fh.write(b"\0" * size)
-        return self.path
-
-    def test_missing_file(self):
-        out = g.cmd_firmware_flash(
-            Args(host="10.0.0.5", image="/no/such/file", yes=True))
-        self.assertFalse(out["ok"])
-        self.assertIn("cannot read image", out["error"])
-
-    def test_refuses_without_yes(self):
-        path = self.write(g.FW_MIN_SIZE + 1)
-        with mock.patch.object(g, "accessory_info", return_value={"productName": "K"}), \
-             mock.patch.object(g, "flash_firmware") as flash:
-            out = g.cmd_firmware_flash(Args(host="10.0.0.5", image=path, yes=False))
-        self.assertFalse(out["ok"])
-        self.assertIn("--yes", out["error"])
-        flash.assert_not_called()
-
-    def test_refuses_implausible_size(self):
-        path = self.write(128)
-        with mock.patch.object(g, "flash_firmware") as flash:
-            out = g.cmd_firmware_flash(Args(host="10.0.0.5", image=path, yes=True))
-        self.assertFalse(out["ok"])
-        flash.assert_not_called()
-
-    def test_refuses_when_light_silent(self):
-        path = self.write(g.FW_MIN_SIZE + 1)
-        with mock.patch.object(g, "accessory_info", return_value={}), \
-             mock.patch.object(g, "flash_firmware") as flash:
-            out = g.cmd_firmware_flash(Args(host="10.0.0.5", image=path, yes=True))
-        self.assertFalse(out["ok"])
-        flash.assert_not_called()
-
-    def test_reports_before_and_after_on_success(self):
-        path = self.write(g.FW_MIN_SIZE + 1)
-        infos = iter([
-            {"firmwareVersion": "1.0.2", "firmwareBuildNumber": 218},
-            {"firmwareVersion": "1.0.3", "firmwareBuildNumber": 222},
-        ])
-        with mock.patch.object(g, "accessory_info", side_effect=lambda d: next(infos)), \
-             mock.patch.object(g, "flash_firmware"), \
-             mock.patch.object(g.time, "sleep"):
-            out = g.cmd_firmware_flash(Args(host="10.0.0.5", image=path, yes=True))
-        self.assertTrue(out["ok"])
-        self.assertEqual(out["before"]["firmwareVersion"], "1.0.2")
-        self.assertEqual(out["after"]["firmwareVersion"], "1.0.3")
-        self.assertIsNone(out["warning"])
-
-    def test_flash_failure_is_reported_with_progress_log(self):
-        path = self.write(g.FW_MIN_SIZE + 1)
-        with mock.patch.object(g, "accessory_info", return_value={"firmwareVersion": "1.0.3"}), \
-             mock.patch.object(g, "flash_firmware",
-                               side_effect=RuntimeError("chunk at offset 4096 rejected")):
-            out = g.cmd_firmware_flash(Args(host="10.0.0.5", image=path, yes=True))
-        self.assertFalse(out["ok"])
-        self.assertIn("offset 4096", out["error"])
-        self.assertIn("before", out)
-
-    def test_silent_light_after_flash_warns_rather_than_claiming_success(self):
-        path = self.write(g.FW_MIN_SIZE + 1)
-        calls = iter([{"firmwareVersion": "1.0.2"}])
-
-        def info(device):
-            try:
-                return next(calls)
-            except StopIteration:
-                return {}
-
-        # Skip the 90s wait; the point is what it reports when nothing answers.
-        with mock.patch.object(g, "accessory_info", side_effect=info), \
-             mock.patch.object(g, "flash_firmware"), \
-             mock.patch.object(g.time, "sleep"), \
-             mock.patch.object(g.time, "time", side_effect=[0, 100]):
-            out = g.cmd_firmware_flash(Args(host="10.0.0.5", image=path, yes=True))
-        self.assertTrue(out["ok"])
-        self.assertIsNone(out["after"])
-        self.assertIn("power-cycle", out["warning"])
 
 
 if __name__ == "__main__":
