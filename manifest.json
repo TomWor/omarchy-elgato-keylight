@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "nille.elgato-keylight",
   "name": "Elgato Key Light",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "nille",
   "license": "MIT",
   "description": "Elgato Key Light control: power, brightness, and color temperature for one or many lights.",

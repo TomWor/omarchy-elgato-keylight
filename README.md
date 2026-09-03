@@ -113,6 +113,7 @@ strings `"60"` and `"false"`.
 | Left-click a row | Toggle that light |
 | Right-click a row | Rename it |
 | Blink button on a row | Flash that light so you can find it |
+| Quit (bottom right of the panel) | Disable the widget, or exit the harness |
 
 ### Keyboard
 
@@ -192,7 +193,7 @@ its staging flash just by being addressed.
 - `scripts/keylight` — the helper CLI: mDNS discovery, HTTP, concurrency
 - `tests/test_keylight.py` — 71 unit tests over the helper
 - `tests/harness/shell.qml` — standalone window for developing the panel without
-  a running Omarchy shell
+  a running Omarchy shell, launched by `tests/harness/run`
 - `preview.png` — composite of the screenshots below, at the repository root
   because that is where the plugin marketplace looks for a listing image
 
@@ -224,8 +225,16 @@ To work on the panel itself without installing it, the harness stands in for the
 bar:
 
 ```bash
-quickshell -p tests/harness/shell.qml
+tests/harness/run
 ```
+
+The wrapper is needed because `quickshell -p tests/harness/shell.qml` on its own
+fails with `module "qs.Ui" is not installed`: the shell's components are imported
+as `qs.Ui` and `qs.Commons`, which only resolve from a file sitting next to a
+`qs/` directory, so `run` builds that directory in a temp dir first. It also sets
+`KEYLIGHT_DIR` to this working tree, which points the helper here instead of at
+the installed copy and makes the panel's Quit button end the harness rather than
+disable the installed widget.
 
 Note that `omarchy plugin add` and `plugin validate` both refuse symlinks
 anywhere inside a plugin folder, so a working tree has to be copied into

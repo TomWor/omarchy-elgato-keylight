@@ -13,7 +13,8 @@ import qs.Ui
 //
 //   quickshell -p tests/harness/shell.qml
 //
-// Set KEYLIGHT_DIR to point the panel's helper at a working tree instead of
+// Launch it through `tests/harness/run`, which builds the `qs/` shim this needs
+// and sets KEYLIGHT_DIR to point the panel's helper at a working tree instead of
 // ~/.config/omarchy/plugins/nille.elgato-keylight.
 ShellRoot {
   id: harness

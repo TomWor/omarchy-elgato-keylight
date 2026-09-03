@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Launch the standalone panel harness.
+#
+# This wrapper exists because `quickshell -p tests/harness/shell.qml` on its own
+# fails with `module "qs.Ui" is not installed`. The shell's components are
+# imported as `qs.Ui` and `qs.Commons`, which resolve relative to the root QML
+# file's directory — so they are only importable from a file sitting next to a
+# `qs/` directory. In the real shell that is /usr/share/omarchy/shell; from this
+# checkout there is no such parent, and no QML_IMPORT_PATH pointing at the shell
+# directory can supply one, because the missing piece is the `qs/` level itself.
+#
+# So the shim is built here, in a temp directory, rather than committed: the
+# plugin folder cannot contain symlinks at all — `omarchy plugin add` and
+# `plugin validate` both refuse them anywhere inside a plugin tree.
+#
+#   tests/harness/run
+#
+# Any extra arguments are passed through to quickshell.
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+root="$(cd "$here/../.." && pwd)"
+
+shell_dir="${OMARCHY_PATH:-/usr/share/omarchy}/shell"
+if [[ ! -d "$shell_dir/Ui" ]]; then
+  echo "error: $shell_dir/Ui not found — is Omarchy 4 installed?" >&2
+  exit 1
+fi
+
+shim="$(mktemp -d)"
+trap 'rm -rf "$shim"' EXIT
+mkdir -p "$shim/qs"
+ln -s "$shell_dir/Ui" "$shim/qs/Ui"
+ln -s "$shell_dir/Commons" "$shim/qs/Commons"
+
+# KEYLIGHT_DIR points the panel's helper at this working tree instead of the
+# installed copy under ~/.config/omarchy/plugins. KEYLIGHT_HARNESS is a separate
+# flag because it is what makes Quit call Qt.quit(): keying that off a path
+# variable a live session might export would kill omarchy-shell.
+QML_IMPORT_PATH="$shim${QML_IMPORT_PATH:+:$QML_IMPORT_PATH}" \
+KEYLIGHT_HARNESS=1 \
+KEYLIGHT_DIR="$root" \
+  exec quickshell -p "$here/shell.qml" "$@"

@@ -20,8 +20,17 @@ Panel {
   // manageIpc: false so this panel owns the single IpcHandler its target
   // allows, and can expose light control to keybindings and scripts.
 
-  readonly property string pluginDir: Quickshell.env("HOME") + "/.config/omarchy/plugins/nille.elgato-keylight"
+  // KEYLIGHT_DIR points the helper at a working tree instead of the installed
+  // plugin, so tests/harness/run drives the code you are editing.
+  readonly property string pluginDir: Quickshell.env("KEYLIGHT_DIR")
+    || (Quickshell.env("HOME") + "/.config/omarchy/plugins/nille.elgato-keylight")
   readonly property string helper: pluginDir + "/scripts/keylight"
+
+  // Separate from KEYLIGHT_DIR on purpose. That one is a path a live shell could
+  // plausibly inherit from the session; this is a flag nothing but the harness
+  // sets, and `quit()` calling Qt.quit() on a stray variable would take down
+  // omarchy-shell rather than one widget.
+  readonly property bool harness: Quickshell.env("KEYLIGHT_HARNESS") === "1"
 
   // ---------------------------------------------------------------- theme
   //
@@ -421,6 +430,19 @@ Panel {
     clampCursor()
   }
 
+  // Stop the widget from the widget itself, so nobody has to go hunting for a
+  // terminal. In the harness that means ending the process; in a real shell it
+  // means disabling the plugin, which the shell applies live over IPC — the
+  // bar icon goes away without a shell restart.
+  function quit() {
+    root.close()
+    if (harness) {
+      Qt.quit()
+      return
+    }
+    Quickshell.execDetached(["omarchy", "plugin", "disable", root.moduleName])
+  }
+
   // ---------------------------------------------------------------- IPC
 
   IpcHandler {
@@ -811,6 +833,26 @@ Panel {
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
               text: "j/k move · h/l adjust · space toggle · a all · g group · n rename · i blink · r rescan"
+            }
+          }
+
+          // ---------- Quit ----------
+          Item {
+            width: parent.width
+            implicitHeight: quitButton.implicitHeight
+
+            Button {
+              id: quitButton
+              anchors.right: parent.right
+              text: "Quit"
+              bordered: true
+              foreground: root.foreground
+              accent: root.accent
+              fontFamily: root.fontFamily
+              tooltipText: root.harness
+                ? "Exit the harness"
+                : "Disable the Key Light widget"
+              onClicked: root.quit()
             }
           }
         }
