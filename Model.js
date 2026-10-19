@@ -142,7 +142,7 @@ function kelvinLabel(kelvin) {
 function barIcon(lights) {
   var list = reachableLights(lights)
   if (!list.length) return "󰌵"
-  if (!anyOn(list)) return "󰛑"
+  if (!anyOn(list)) return "󰹏"
   var level = averageBrightness(list.filter(function(l) { return l.on }))
   if (level >= 66) return "󱩏"
   if (level >= 33) return "󱩑"
